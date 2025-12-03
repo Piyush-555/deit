@@ -59,10 +59,11 @@ class INatDataset(ImageFolder):
 
 
 # Some files are corrupted in IN21K
+corrupt_file_path = "corrupt_imagenet_files.txt"
 CORRUPT_FILES = set()
-if not os.path.isfile(file_path):
-    sys.exit(f"Error: File '{file_path}' not found! Create one")
-with open('corrupt_imagenet_files.txt', 'r') as f:
+if not os.path.isfile(corrupt_file_path):
+    sys.exit(f"Error: File '{corrupt_file_path}' not found! Create one")
+with open(corrupt_file_path, 'r') as f:
     for line in f:
         CORRUPT_FILES.add(line.strip())
 
