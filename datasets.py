@@ -2,9 +2,14 @@
 # All rights reserved.
 import os
 import json
+import PIL
+import warnings
+from pathlib import Path
+from typing import Any, Callable, cast, Optional, Union
 
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import ImageFolder, default_loader
+from torchvision.datasets import DatasetFolder, VisionDataset
 
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import create_transform
@@ -53,7 +58,62 @@ class INatDataset(ImageFolder):
     # __getitem__ and __len__ inherited from ImageFolder
 
 
-def build_dataset(is_train, args):
+# Some files are corrupted in IN21K
+CORRUPT_FILES = set()
+if not os.path.isfile(file_path):
+    sys.exit(f"Error: File '{file_path}' not found! Create one")
+with open('corrupt_imagenet_files.txt', 'r') as f:
+    for line in f:
+        CORRUPT_FILES.add(line.strip())
+
+def is_valid_image(path: str) -> bool:
+    if path in CORRUPT_FILES:
+        return False
+    return True
+
+
+class FilteredINVal(DatasetFolder):
+    def __init__(
+        self,
+        root: Union[str, Path],
+        class_to_idx_21K: dict,
+        loader: Callable[[str], Any] = default_loader,
+        extensions: Optional[tuple[str, ...]] = (".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm", ".tif", ".tiff", ".webp"),
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        is_valid_file: Optional[Callable[[str], bool]] = None,
+        allow_empty: bool = False,
+    ) -> None:
+        VisionDataset.__init__(self, root, transform=transform, target_transform=target_transform)
+        classes, class_to_idx = self.find_classes(self.root)
+
+        # ignore n04399382 (present in 1k-val but not in 21k)
+        del class_to_idx["n04399382"]
+        classes.remove("n04399382")
+
+        # map 1k idx to 21k idx
+        for k in class_to_idx:
+            class_to_idx[k] = class_to_idx_21K[k]
+
+        samples = self.make_dataset(
+            self.root,
+            class_to_idx=class_to_idx,
+            extensions=extensions,
+            is_valid_file=is_valid_file,
+            allow_empty=allow_empty,
+        )
+
+        self.loader = loader
+        self.extensions = extensions
+
+        self.classes = classes
+        self.class_to_idx = class_to_idx
+        self.samples = samples
+        self.targets = [s[1] for s in samples]
+        self.imgs = self.samples
+
+
+def build_dataset(is_train, args, c2i21k=None):
     transform = build_transform(is_train, args)
 
     if args.data_set == 'CIFAR':
@@ -71,6 +131,17 @@ def build_dataset(is_train, args):
         dataset = INatDataset(args.data_path, train=is_train, year=2019,
                               category=args.inat_category, transform=transform)
         nb_classes = dataset.nb_classes
+    elif args.data_set == "IMNET21K":
+        nb_classes = 19167
+        if is_train:
+            # use 21K
+            root = "/mnt/data/Public_datasets/ImageNet21K/winter21_whole/"
+            dataset = datasets.ImageFolder(root, transform=transform, is_valid_file=is_valid_image)
+        else:
+            # use 1k-val, accuracy metric is going to be wrong (not calculated on 999 classes, but still an indicator)
+            root = "/mnt/data/Public_datasets/imagenet/imagenet_pytorch/val/"
+            dataset = FilteredINVal(root, class_to_idx_21K=c2i21k, transform=transform)
+            assert len(dataset.classes) == 999
 
     return dataset, nb_classes
 
