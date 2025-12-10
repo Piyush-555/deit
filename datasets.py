@@ -1,18 +1,23 @@
 # Copyright (c) 2015-present, Facebook, Inc.
 # All rights reserved.
 import os
+import glob
 import json
 import PIL
+import pickle
 import warnings
 from pathlib import Path
 from typing import Any, Callable, cast, Optional, Union
 
+import torch
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import ImageFolder, default_loader
 from torchvision.datasets import DatasetFolder, VisionDataset
 
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import create_transform
+import webdataset as wds
+from webdataset import handlers
 
 
 class INatDataset(ImageFolder):
@@ -67,6 +72,7 @@ with open(corrupt_file_path, 'r') as f:
     for line in f:
         CORRUPT_FILES.add(line.strip())
 
+
 def is_valid_image(path: str) -> bool:
     if path in CORRUPT_FILES:
         return False
@@ -74,6 +80,9 @@ def is_valid_image(path: str) -> bool:
 
 
 class FilteredINVal(DatasetFolder):
+    """
+    To be used with winter21-21k, coyo-300m
+    """
     def __init__(
         self,
         root: Union[str, Path],
@@ -88,7 +97,7 @@ class FilteredINVal(DatasetFolder):
         VisionDataset.__init__(self, root, transform=transform, target_transform=target_transform)
         classes, class_to_idx = self.find_classes(self.root)
 
-        # ignore n04399382 (present in 1k-val but not in 21k)
+        # ignore n04399382 (present in 1k-val but not in 21k or coyo)
         del class_to_idx["n04399382"]
         classes.remove("n04399382")
 
@@ -112,6 +121,23 @@ class FilteredINVal(DatasetFolder):
         self.samples = samples
         self.targets = [s[1] for s in samples]
         self.imgs = self.samples
+
+
+class PreprocessCOYO:
+    def __init__(self, transform, nb_classes):
+        self.transform = transform
+        self.nb_classes = nb_classes
+
+    def __call__(self, sample):
+        imgs, json = sample
+        if isinstance(imgs, list):  # batch of images
+            imgs = [self.transform(img) for img in imgs]
+        else:  # single image
+            imgs = self.transform(imgs)
+        top_50, top_50_probs = json["labels"], json["label_probs"]
+        labels = torch.zeros(self.nb_classes, dtype=torch.float32)
+        labels[torch.tensor(top_50)] = torch.tensor(top_50_probs, dtype=torch.float32)
+        return imgs, labels
 
 
 def build_dataset(is_train, args, c2i21k=None):
@@ -141,6 +167,34 @@ def build_dataset(is_train, args, c2i21k=None):
         else:
             # use 1k-val, accuracy metric is going to be wrong (not calculated on 999 classes, but still an indicator)
             root = "/mnt/data/Public_datasets/imagenet/imagenet_pytorch/val/"
+            dataset = FilteredINVal(root, class_to_idx_21K=c2i21k, transform=transform)
+            assert len(dataset.classes) == 999
+    elif args.data_set == "COYO300M":
+        nb_classes = 21841
+        if is_train:
+            # use coyo300m
+            urls = glob.glob(f"{args.data_path}*.tar")
+
+            dataset = wds.DataPipeline(
+                wds.SimpleShardList(urls),
+                wds.shuffle(10000),  # shuffle over shards
+
+                # add wds.split_by_node here if you are using multiple nodes
+                wds.split_by_worker,
+
+                wds.tarfile_to_samples(),
+                wds.shuffle(1000),
+                wds.decode("pil", handler=handlers.warn_and_continue),
+                wds.to_tuple("jpg", "json"),
+            )
+
+            # transform an attribute so it can be made mutable
+            dataset.preproc = PreprocessCOYO(transform, nb_classes)
+            dataset.append(wds.map(dataset.preproc))
+        else:
+            imtree_path = "/mnt/proj3/open-35-39/hf_caches/hub/datasets--kakaobrain--coyo-labeled-300m/snapshots/8d62a7d805261fc2ffd233a4f31e33049d87eec4/imagenet21k_tree.pickle"
+            c2i21k = pickle.load(open(imtree_path, 'rb'))["class_list"]
+            root = "/mnt/proj3/open-35-39/datasets/imagenet1k/imagenet_pytorch/val/"
             dataset = FilteredINVal(root, class_to_idx_21K=c2i21k, transform=transform)
             assert len(dataset.classes) == 999
 

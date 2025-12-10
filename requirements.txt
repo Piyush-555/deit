@@ -2,9 +2,6 @@ python-dotenv==1.2.1
 rootutils==1.0.7
 omegaconf==2.3.0
 tqdm==4.67.1
-numpy==2.3.5
-pytorch==2.6.0
-torchvision==0.21.0
 tensorboard==2.20.0
 torchinfo==1.8.0
 transformers==4.57.1
@@ -13,3 +10,6 @@ accelerate==1.11.0
 datasets==4.4.1
 einops==0.8.1
 wandb==0.23.0
+
+# moved numpy, scipy to .envrc
+# pytorch, torchvision from official index

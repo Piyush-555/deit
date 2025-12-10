@@ -1,0 +1,19 @@
+#!/bin/bash
+
+sbatch <<EOT
+#!/bin/bash
+#SBATCH -A open-35-39
+#SBATCH -p qgpu
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=100
+#SBATCH -t 2-00:00:00
+#SBATCH -o output.log
+#SBATCH -e error.log
+
+cd /mnt/proj3/open-35-39/projects/deit/
+ml Python/3.11.5-GCCcore-13.2.0
+source coyo_download_venv/bin/activate
+
+python download_coyo.py
+EOT

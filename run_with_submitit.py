@@ -108,12 +108,12 @@ def main():
         # Below are cluster dependent parameters
         slurm_partition=partition,
         slurm_signal_delay_s=120,
+        account="open-35-39",
         **kwargs
     )
 
     executor.update_parameters(name="deit")
-
-    args.dist_url = get_init_file().as_uri()
+    args.dist_url = get_init_file().resolve().as_uri()  # get absolute path
     args.output_dir = args.job_dir
 
     trainer = Trainer(args)

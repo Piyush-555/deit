@@ -10,14 +10,16 @@ import json
 
 from pathlib import Path
 
+import timm.data
 from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
+import webdataset as wds
 
-from datasets import build_dataset
+from datasets import build_dataset, PreprocessCOYO
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
@@ -159,7 +161,7 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'IMNET21K'],
+    parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'IMNET21K', 'COYO300M'],
                         type=str, help='Image Net dataset path')
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -191,6 +193,49 @@ def get_args_parser():
     return parser
 
 
+class LenWrapper:
+    """
+    For IterableDataset, maybe the first pass is expensive, but should work out-of-the-box with variable GPUs/Nodes
+    """
+    def __init__(self, iterator, N):
+        self.__dict__['iterator'] = iterator
+        self.__dict__['N'] = N
+
+    def __iter__(self):
+        return iter(self.iterator)
+
+    def __getattr__(self, name):
+        if name in ['iterator', 'N']:
+            return self.__dict__[name]
+        return getattr(self.iterator, name)
+
+    def __setattr__(self, name, value):
+        if name in ['iterator', 'N']:
+            self.__dict__[name] = value
+        else:
+            setattr(self.iterator, name, value)
+
+    def __len__(self):
+        return self.N
+
+
+def mixup_target_soft(targets, num_classes=None, lam=1., smoothing=0.0):
+    return lam * targets + (1. - lam) * targets.flip(0)
+
+
+class MixupSoft(Mixup):
+    def __call__(self, x, target):
+        assert len(x) % 2 == 0, 'Batch size should be even when using this'
+        if self.mode == 'elem':
+            lam = self._mix_elem(x)
+        elif self.mode == 'pair':
+            lam = self._mix_pair(x)
+        else:
+            lam = self._mix_batch(x)
+        target = mixup_target_soft(target, self.num_classes, lam, self.label_smoothing)
+        return x, target
+
+
 def main(args):
     utils.init_distributed_mode(args)
 
@@ -212,7 +257,14 @@ def main(args):
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset(is_train=False, args=args, c2i21k=dataset_train.class_to_idx if args.data_set=="IMNET21K" else None)
 
-    if args.distributed:
+    if args.data_set=="COYO300M":
+        assert args.distributed
+        # uses Iterable dataset that doesn't like DistributedSampler
+        # WebDataset takes care of split by node/worker and shuffle
+        sampler_train = None
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)  # val is ok
+
+    elif args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
         if args.repeated_aug:
@@ -236,15 +288,26 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
+    if args.data_set=="COYO300M":
+        dataset_train.append(wds.batched(args.batch_size))
+        data_loader_train = wds.WebLoader(dataset_train, batch_size=None, num_workers=args.num_workers, pin_memory=args.pin_mem)
+        global_num_batches = 101_994_593 // (args.batch_size * torch.distributed.get_world_size())
+        # global_num_batches = 50_667 // (args.batch_size * torch.distributed.get_world_size())  # coyo_test/
+        data_loader_train = data_loader_train.with_epoch(global_num_batches)
+        data_loader_train = LenWrapper(data_loader_train, global_num_batches)
+    else:
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, sampler=sampler_train,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=True,
+        )
     if args.ThreeAugment:
-        data_loader_train.dataset.transform = new_data_aug_generator(args)
+        if args.data_set=="COYO300M":
+            data_loader_train.iterator.pipeline[0].dataset.preproc.transform = new_data_aug_generator(args)
+        else:
+            data_loader_train.dataset.transform = new_data_aug_generator(args)
 
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
@@ -257,7 +320,13 @@ def main(args):
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
     if mixup_active:
-        mixup_fn = Mixup(
+        if args.data_set=="COYO300M":
+            # already has soft targets, no onehot needed. timm expects onehot
+            mixup_cls = MixupSoft
+        else:
+            mixup_cls = Mixup
+
+        mixup_fn = mixup_cls(
             mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
@@ -430,7 +499,8 @@ def main(args):
     start_time = time.time()
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+        if args.distributed and not args.data_set=="COYO300M":
+            # goes with DistributedSampler to shuffle after each epoch
             data_loader_train.sampler.set_epoch(epoch)
 
         train_stats = train_one_epoch(
@@ -456,7 +526,7 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-            if epoch%10==0:
+            if epoch%1==0:
                 checkpoint_paths = [output_dir / f'checkpoint_{epoch}.pth']
                 for checkpoint_path in checkpoint_paths:
                     utils.save_on_master({
