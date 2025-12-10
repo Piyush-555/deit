@@ -10,13 +10,14 @@ from typing import Iterable, Optional
 import torch
 
 from timm.data import Mixup
+from timm.scheduler.scheduler import Scheduler
 from timm.utils import accuracy, ModelEma
 
 from losses import DistillationLoss
 import utils
 
 
-def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
+def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss, lr_scheduler: Scheduler,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
@@ -26,7 +27,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
-    
+
+    if args.sched_on_updates:
+        num_steps = epoch * args.updates_per_epoch
+
     if args.cosub:
         criterion = torch.nn.BCEWithLogitsLoss()
         
@@ -70,6 +74,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         torch.cuda.synchronize()
         if model_ema is not None:
             model_ema.update(model)
+
+        # step-based lr scheduler
+        if args.sched_on_updates:
+            num_steps += 1
+            lr_scheduler.step_update(num_steps)
 
         metric_logger.update(loss=loss_value)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
