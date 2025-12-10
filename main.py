@@ -355,7 +355,8 @@ def main(args):
     optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
 
-    if not args.sched_on_updates:
+    args.updates_per_epoch = 0
+    if args.sched_on_updates:
         print("LR scheduler updates on steps")
         if not args.data_set=="COYO300M":
             try:
@@ -364,7 +365,7 @@ def main(args):
                 print("Train loader length cannot be estimated. Put in manually")
         args.updates_per_epoch = global_num_batches
 
-    lr_scheduler, _ = create_scheduler(args, optimizer)
+    lr_scheduler, _ = create_scheduler(args, optimizer, args.updates_per_epoch)
 
     criterion = LabelSmoothingCrossEntropy()
 
